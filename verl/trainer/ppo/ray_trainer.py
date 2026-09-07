@@ -301,6 +301,21 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         data.meta_info["bundle_paper_scores"] = bundle_paper_scores
+    elif adv_estimator == AdvantageEstimator.RISK_QUATRO:
+        if "uid" not in data.non_tensor_batch or "bundle_uid" not in data.non_tensor_batch:
+            raise ValueError("risk_quatro requires both uid and bundle_uid in the batch")
+        advantages, returns, query_lambdas, query_mus, risk_utilities = core_algos.compute_risk_quatro_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            bundle_uid=data.non_tensor_batch["bundle_uid"],
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        data.meta_info["risk_quatro_lambdas"] = query_lambdas
+        data.meta_info["risk_quatro_mus"] = query_mus
+        data.meta_info["risk_quatro_utilities"] = risk_utilities
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -468,6 +483,7 @@ class RayPPOTrainer:
             AdvantageEstimator.GRPO_RVAR,
             AdvantageEstimator.GRPO_BUNDLE_RVAR,
             AdvantageEstimator.GRPO_BUNDLE_RVAR_QUANTILE_TRACKING,
+            AdvantageEstimator.RISK_QUATRO,
         ]:
             self.use_critic = False
         else:
@@ -479,6 +495,7 @@ class RayPPOTrainer:
             AdvantageEstimator.GRPO_RVAR,
             AdvantageEstimator.GRPO_BUNDLE_RVAR,
             AdvantageEstimator.GRPO_BUNDLE_RVAR_QUANTILE_TRACKING,
+            AdvantageEstimator.RISK_QUATRO,
         ]:
             self.risk_measure = True
         else:
@@ -487,7 +504,13 @@ class RayPPOTrainer:
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-        if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO_BUNDLE_RVAR_QUANTILE_TRACKING or self.config.algorithm.quantile_tracking:
+        if (
+            self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO_BUNDLE_RVAR_QUANTILE_TRACKING
+            or (
+                self.config.algorithm.quantile_tracking
+                and self.config.algorithm.adv_estimator != AdvantageEstimator.RISK_QUATRO
+            )
+        ):
             self.quantile_tracking = True
             self.alpha_list = torch.tensor([0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95])
             self.q = torch.nn.Parameter(torch.zeros_like(self.alpha_list).clone(), requires_grad=True)

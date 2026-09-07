@@ -84,9 +84,42 @@ custom_reward_function:
 algorithm:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs in the entrypoint
   _target_: verl.trainer.config.AlgoConfig
+  # Discount factor for future rewards
   gamma: 1.0
+
+  # Trade-off between bias and variance in the GAE estimator
   lam: 1.0
+
+  # Advantage estimator type: use risk_quatro for the hybrid objective
   adv_estimator: gae
+
+  # Lower and upper quantiles used by RiskPO MVaR
+  quantile_down: 0.2
+
+  quantile_up: 0.9
+
+  # MVaR lower-tail mixing weight (omega)
+  mvar_omega: 1.5
+
+  # Monte Carlo contexts for conditional RiskPO utility
+  conditional_mc_samples: 8
+
+  # QUATRO per-query KL trust-region radius
+  quatro_delta: 0.01
+
+  # Number of dual optimization steps per query
+  quatro_dual_steps: 20
+
+  # Learning rate for the dual optimization in log-lambda space
+  quatro_dual_lr: 0.1
+
+  # Initial positive lambda for the dual solver
+  quatro_initial_lambda: 1.0
+
+  # Numerical bounds for query-wise lambda
+  quatro_lambda_min: 0.001
+
+  quatro_lambda_max: 1000.0
   norm_adv_by_std_in_grpo: True
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence

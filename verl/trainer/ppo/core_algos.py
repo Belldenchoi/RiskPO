@@ -136,6 +136,7 @@ class AdvantageEstimator(str, Enum):
     GRPO_RVAR = "grpo_RVaR"
     GRPO_BUNDLE_RVAR = "grpo_bundle_RVaR"
     GRPO_BUNDLE_RVAR_QUANTILE_TRACKING = "grpo_bundle_RVaR_quantile_tracking"
+    RISK_QUATRO = "risk_quatro"
 
 class AdaptiveKLController:
     """
@@ -813,6 +814,201 @@ def compute_grpo_bundle_rvar_outcome_advantage_quantile_tracking(
 
     return advantages, returns, bundle_paper_scores
 
+
+def _mvar_signal(values: torch.Tensor, quantile_down: torch.Tensor, quantile_up: torch.Tensor, omega: float) -> torch.Tensor:
+    """Evaluate the MVaR signal from the RiskPO design for one or more contexts."""
+    lower_tail = torch.clamp(quantile_down - values, min=0)
+    g_value = (
+        torch.clamp(values - quantile_down, min=0)
+        - torch.clamp(values - quantile_up, min=0)
+        + quantile_down
+        - quantile_up
+    )
+    return -(1.0 + omega) * lower_tail + g_value
+
+
+def compute_riskpo_bundle_signal(
+    bundle_rewards: torch.Tensor,
+    quantile_down: float = 0.2,
+    quantile_up: float = 0.9,
+    omega: float = 1.5,
+) -> torch.Tensor:
+    """Compute MVaR signals for a bundle-reward distribution."""
+    if bundle_rewards.numel() == 0:
+        raise ValueError("bundle_rewards must contain at least one value")
+    bundle_rewards = bundle_rewards.float()
+    if not 0.0 <= quantile_down < quantile_up <= 1.0:
+        raise ValueError("quantile_down and quantile_up must satisfy 0 <= down < up <= 1")
+    q_down = torch.quantile(bundle_rewards, quantile_down)
+    q_up = torch.quantile(bundle_rewards, quantile_up)
+    return _mvar_signal(bundle_rewards, q_down, q_up, omega)
+
+
+def _solve_query_dual(
+    utilities: torch.Tensor,
+    delta: float,
+    steps: int,
+    learning_rate: float,
+    initial_lambda: float,
+    lambda_min: float,
+    lambda_max: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Solve the query-wise QUATRO dual and return (lambda, mu)."""
+    utilities = utilities.float()
+    log_lambda = torch.tensor(
+        float(max(initial_lambda, lambda_min)), device=utilities.device, dtype=utilities.dtype
+    ).log()
+    for _ in range(max(int(steps), 0)):
+        lam = log_lambda.exp().clamp(min=lambda_min, max=lambda_max)
+        scaled = utilities / lam
+        log_z = torch.logsumexp(scaled, dim=0) - np.log(max(utilities.numel(), 1))
+        tilted_mean = torch.sum(torch.softmax(scaled, dim=0) * utilities)
+        # d f(lambda) / d log(lambda) = lambda * (delta + log Z - E_q[U] / lambda)
+        grad_log_lambda = lam * (delta + log_z - tilted_mean / lam)
+        log_lambda = log_lambda - learning_rate * grad_log_lambda
+        log_lambda = log_lambda.clamp(min=np.log(lambda_min), max=np.log(lambda_max))
+
+    lam = log_lambda.exp().clamp(min=lambda_min, max=lambda_max)
+    log_z = torch.logsumexp(utilities / lam, dim=0) - np.log(max(utilities.numel(), 1))
+    mu = lam * (log_z - 1.0)
+    return lam, mu
+
+
+def solve_quatro_lambda(
+    utilities: torch.Tensor,
+    delta: float = 0.01,
+    steps: int = 20,
+    learning_rate: float = 0.1,
+    initial_lambda: float = 1.0,
+    lambda_min: float = 1e-3,
+    lambda_max: float = 1e3,
+) -> torch.Tensor:
+    """Solve the QUATRO dual and return the query-specific lambda."""
+    lam, _ = _solve_query_dual(
+        utilities,
+        delta=delta,
+        steps=steps,
+        learning_rate=learning_rate,
+        initial_lambda=initial_lambda,
+        lambda_min=lambda_min,
+        lambda_max=lambda_max,
+    )
+    return lam
+
+
+def compute_conditional_risk_utility(
+    candidate_reward: torch.Tensor,
+    other_response_rewards: list[torch.Tensor],
+    quantile_down: torch.Tensor,
+    quantile_up: torch.Tensor,
+    omega: float = 1.5,
+    mc_samples: int = 8,
+) -> torch.Tensor:
+    """Estimate one response's conditional MVaR utility by Monte Carlo."""
+    sample_count = max(int(mc_samples), 1)
+    candidate_reward = candidate_reward.float()
+    contexts = candidate_reward.expand(sample_count)
+    for response_rewards in other_response_rewards:
+        response_rewards = response_rewards.flatten()
+        if response_rewards.numel() == 0:
+            continue
+        sampled = torch.randint(response_rewards.numel(), (sample_count,), device=response_rewards.device)
+        contexts = contexts + response_rewards[sampled]
+    return _mvar_signal(contexts, quantile_down, quantile_up, omega).mean()
+
+
+@register_adv_est(AdvantageEstimator.RISK_QUATRO)
+def compute_risk_quatro_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    bundle_uid: np.ndarray,
+    config: Optional["AlgoConfig"] = None,
+    epsilon: float = 1e-6,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, dict, dict, dict]:
+    """Compute conditional RiskPO utilities and query-wise QUATRO advantages.
+
+    Each candidate response keeps its own reward fixed while responses from the
+    other queries in the same bundle are sampled independently.  The resulting
+    Monte Carlo MVaR utility is then transformed by a query-specific QUATRO
+    dual (lambda, mu) pair.
+    """
+    if config is None:
+        config = {}
+    quantile_down = float(config.get("quantile_down", 0.2))
+    quantile_up = float(config.get("quantile_up", 0.9))
+    omega = float(config.get("mvar_omega", config.get("w_mix", 1.5)))
+    mc_samples = max(int(config.get("conditional_mc_samples", 8)), 1)
+    dual_steps = int(config.get("quatro_dual_steps", 20))
+    dual_lr = float(config.get("quatro_dual_lr", 0.1))
+    initial_lambda = float(config.get("quatro_initial_lambda", 1.0))
+    lambda_min = float(config.get("quatro_lambda_min", 1e-3))
+    lambda_max = float(config.get("quatro_lambda_max", 1e3))
+    delta = float(config.get("quatro_delta", 0.01))
+    if not 0.0 <= quantile_down < quantile_up <= 1.0:
+        raise ValueError("quantile_down and quantile_up must satisfy 0 <= down < up <= 1")
+
+    scores = token_level_rewards.sum(dim=-1).detach().float()
+    groups: dict[object, dict[object, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for row, (bundle_id, query_id) in enumerate(zip(bundle_uid, index)):
+        groups[bundle_id][query_id].append(row)
+
+    response_utilities = torch.zeros_like(scores)
+    response_advantages = torch.zeros_like(scores)
+    query_lambdas: dict[object, float] = {}
+    query_mus: dict[object, float] = {}
+
+    with torch.no_grad():
+        for bundle_id, query_groups in groups.items():
+            # RiskPO bundles are formed by aligned rollout indices.  The minimum
+            # response count keeps the bundle distribution well-defined when a
+            # sampler produces an incomplete group.
+            bundle_rollout_count = min(len(rows) for rows in query_groups.values())
+            bundle_context_scores = torch.stack(
+                [
+                    torch.stack([scores[rows[rollout]] for rows in query_groups.values()]).sum()
+                    for rollout in range(bundle_rollout_count)
+                ]
+            )
+            q_down = torch.quantile(bundle_context_scores, quantile_down)
+            q_up = torch.quantile(bundle_context_scores, quantile_up)
+
+            for query_id, candidate_rows in query_groups.items():
+                other_groups = [rows for other_id, rows in query_groups.items() if other_id != query_id]
+                utilities = []
+                for row in candidate_rows:
+                    utilities.append(
+                        compute_conditional_risk_utility(
+                            scores[row],
+                            [scores[other_rows] for other_rows in other_groups],
+                            q_down,
+                            q_up,
+                            omega=omega,
+                            mc_samples=mc_samples,
+                        )
+                    )
+
+                query_utilities = torch.stack(utilities)
+                lam, mu = _solve_query_dual(
+                    query_utilities,
+                    delta=delta,
+                    steps=dual_steps,
+                    learning_rate=dual_lr,
+                    initial_lambda=initial_lambda,
+                    lambda_min=lambda_min,
+                    lambda_max=lambda_max,
+                )
+                query_lambdas[query_id] = float(lam.cpu())
+                query_mus[query_id] = float(mu.cpu())
+                query_advantages = (query_utilities - mu) / lam - 1.0
+                for position, (row, advantage) in enumerate(zip(candidate_rows, query_advantages)):
+                    response_utilities[row] = query_utilities[position]
+                    response_advantages[row] = advantage
+
+    advantages = response_advantages.unsqueeze(-1) * response_mask
+    return advantages, advantages.clone(), query_lambdas, query_mus, response_utilities
+
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
 def compute_grpo_passk_outcome_advantage(
     token_level_rewards: torch.Tensor,
@@ -1297,6 +1493,53 @@ def compute_policy_loss(
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+@register_policy_loss("risk_quatro")
+def compute_policy_loss_risk_quatro(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Risk-QUATRO trust-region loss without PPO clipping.
+
+    The response-level importance ratio is broadcast to its tokens with a
+    straight-through log-ratio representation.  This preserves the sequence
+    ratio in the forward pass while giving every response token a gradient.
+    """
+    if config is None:
+        config = {}
+    policy_config = config.get("policy_loss", config)
+    ratio_mode = policy_config.get("quatro_ratio_mode", "trajectory")
+    if ratio_mode not in {"trajectory", "geometric"}:
+        raise ValueError(f"Invalid quatro_ratio_mode: {ratio_mode}")
+
+    token_log_ratio = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
+    seq_lengths = response_mask.sum(dim=-1).clamp(min=1)
+    if ratio_mode == "trajectory":
+        sequence_log_ratio = (token_log_ratio * response_mask).sum(dim=-1)
+    else:
+        sequence_log_ratio = (token_log_ratio * response_mask).sum(dim=-1) / seq_lengths
+    sequence_log_ratio = torch.clamp(sequence_log_ratio, min=-20.0, max=20.0)
+
+    # Straight-through construction: forward value is the sequence ratio,
+    # while d(log_prob_token)/d(theta) remains available for every token.
+    token_log_ratio_st = log_prob - log_prob.detach() + sequence_log_ratio.detach().unsqueeze(-1)
+    ratio = torch.exp(token_log_ratio_st)
+    response_advantages = verl_F.masked_mean(advantages, response_mask, axis=-1)
+    advantage_term = response_advantages.detach().unsqueeze(-1) - sequence_log_ratio.detach().unsqueeze(-1)
+    pg_losses = -ratio * advantage_term
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode="seq-mean-token-mean",
+    )
+    ppo_kl = verl_F.masked_mean(-token_log_ratio, response_mask)
+    zero = torch.zeros((), device=pg_loss.device, dtype=pg_loss.dtype)
+    return pg_loss, zero, ppo_kl, zero
 
 
 @register_policy_loss("gspo")

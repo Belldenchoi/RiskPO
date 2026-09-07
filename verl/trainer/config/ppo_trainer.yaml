@@ -157,6 +157,28 @@ algorithm:
   # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
   adv_estimator: gae
 
+  # MVaR lower-tail mixing weight (omega)
+  mvar_omega: 1.5
+
+  # Monte Carlo contexts for conditional RiskPO utility
+  conditional_mc_samples: 8
+
+  # QUATRO per-query KL trust-region radius
+  quatro_delta: 0.01
+
+  # Number of dual optimization steps per query
+  quatro_dual_steps: 20
+
+  # Learning rate for the dual optimization in log-lambda space
+  quatro_dual_lr: 0.1
+
+  # Initial positive lambda for the dual solver
+  quatro_initial_lambda: 1.0
+
+  # Numerical bounds for query-wise lambda
+  quatro_lambda_min: 0.001
+  quatro_lambda_max: 1000.0
+
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
@@ -205,8 +227,8 @@ algorithm:
   # Quantile for GRPO-RVaR
   quantile_up: 0.9
 
-  # Quantile for GRPO-RVaR
-  quantile_down: 0.1
+  # Lower quantile for RiskPO MVaR and GRPO-RVaR
+  quantile_down: 0.2
 
   # Bundle size for GRPO-Quantile and dualCVaR
   bundle_size: 5

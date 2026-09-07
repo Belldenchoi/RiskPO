@@ -100,6 +100,16 @@ class AlgoConfig(BaseConfig):
         "use_kl_in_reward",
         "kl_penalty",
         "use_pf_ppo",
+        "quantile_down",
+        "quantile_up",
+        "mvar_omega",
+        "conditional_mc_samples",
+        "quatro_delta",
+        "quatro_dual_steps",
+        "quatro_dual_lr",
+        "quatro_initial_lambda",
+        "quatro_lambda_min",
+        "quatro_lambda_max",
     ]
 
     gamma: float = 1.0
@@ -110,5 +120,26 @@ class AlgoConfig(BaseConfig):
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)
     use_pf_ppo: bool = False
+
+    quantile_down: float = 0.2
+
+    quantile_up: float = 0.9
+
+    mvar_omega: float = 1.5
+
+    conditional_mc_samples: int = 8
+
+    quatro_delta: float = 0.01
+
+    quatro_dual_steps: int = 20
+
+    quatro_dual_lr: float = 0.1
+
+    quatro_initial_lambda: float = 1.0
+
+    quatro_lambda_min: float = 1e-3
+
+    quatro_lambda_max: float = 1e3
+
     pf_ppo: Optional[PFPPOConfig] = None
     filter_groups: Optional[FilterGroupsConfig] = None
