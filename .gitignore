@@ -95,6 +95,7 @@ celerybeat-schedule
 
 # dotenv
 .env
+.env.*
 
 # virtualenv
 venv/
@@ -128,3 +129,11 @@ logs
 log
 outputs
 .history
+
+# Local Telemath data and Netmind API experiment runs
+telemath/
+runs/
+
+# Local setup and notebook verification caches
+.uv-cache/
+.notebook_checks/
