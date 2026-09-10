@@ -1,0 +1,15 @@
+{
+  "source": "RiskPO_Original_Qwen3_4B_4xA100_Local_Full.ipynb",
+  "source_sha256": "051063c65bfc8a689c496ec26f17a416759beea3bed7f8cb738b061d73107033",
+  "repo_commit": "68ed7c5898b009fe7e392c2b01feb85b3bb2ff18",
+  "method": "riskpo",
+  "world_size": 4,
+  "preserved": [
+    "config builders",
+    "reward",
+    "thinking dataset",
+    "NCCL test",
+    "data audit",
+    "export"
+  ]
+}

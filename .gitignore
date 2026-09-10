@@ -137,3 +137,8 @@ runs/
 # Local setup and notebook verification caches
 .uv-cache/
 .notebook_checks/
+
+# Four-A100 local Python workflow artifacts
+riskpo_local_runtime/
+environment_report.json
+verl/trainer/config/local_full_riskpo_*.yaml
