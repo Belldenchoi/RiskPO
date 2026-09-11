@@ -22,6 +22,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--report', type=Path, default=Path('environment_report.json'))
     parser.add_argument('--metadata-only', action='store_true', help='Skip GPU/library imports and pip check')
+    parser.add_argument('--gpu-count', type=int, choices=[2, 4], default=4)
+    parser.add_argument('--gpu-family', choices=['A100', 'L40'], default='A100')
     args = parser.parse_args()
     report = {'os': platform.system(), 'architecture': platform.machine(), 'libc': platform.libc_ver(),
               'python': sys.version, 'executable': sys.executable, 'in_venv': sys.prefix != sys.base_prefix,
@@ -43,14 +45,21 @@ def main():
             report['errors'].append(f'{name}: expected {PINS[name]}, found {version}')
     env = dict(os.environ, HF_HUB_OFFLINE='1', HF_DATASETS_OFFLINE='1', HF_HUB_DISABLE_TELEMETRY='1',
                RAY_USAGE_STATS_ENABLED='0', VLLM_USE_V1='0')
-    env.setdefault('CUDA_VISIBLE_DEVICES', '0,1,2,3')
+    env.setdefault('CUDA_VISIBLE_DEVICES', ','.join(map(str, range(args.gpu_count))))
     repo = Path(__file__).resolve().parent.parent
     env['PYTHONPATH'] = str(repo) + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
     commands = {'nvidia_smi': ['nvidia-smi', '--query-gpu=name,driver_version,memory.total', '--format=csv,noheader']}
     if not args.metadata_only:
         commands['pip_check'] = [sys.executable, '-m', 'pip', 'check']
         if not report['errors']:
-            commands['gpu_import_reward_checks'] = [sys.executable, str(Path(__file__).with_name('gpu_checks.py'))]
+            if args.gpu_count == 4 and args.gpu_family == 'A100':
+                gpu_check = Path(__file__).with_name('gpu_checks.py')
+            elif args.gpu_count == 2 and args.gpu_family == 'L40':
+                gpu_check = repo / 'local_2l40/gpu_checks.py'
+            else:
+                raise ValueError('Supported targets: 4 A100 or 2 L40')
+            commands['gpu_import_reward_checks'] = [sys.executable, str(gpu_check)]
+    commands['gpu_topology'] = ['nvidia-smi', 'topo', '-m']
     for name, command in commands.items():
         print('Checking:', name, flush=True)
         try:

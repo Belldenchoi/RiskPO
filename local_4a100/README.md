@@ -1,5 +1,8 @@
 # Chạy RiskPO gốc trên 4 A100 bằng Python
 
+Server **2 L40** dùng launcher `local_2l40/train.py`; xem [hướng dẫn 2 L40](../local_2l40/README.md).
+Launcher 4 A100 này giữ cấu hình cũ làm mặc định.
+
 Bộ file này chuyển từ `RiskPO_Original_Qwen3_4B_4xA100_Local_Full.ipynb`.
 Giữ Qwen/Qwen3-4B, LoRA rank 8/alpha 16, tắt thinking, RiskPO gốc có quantile
 tracking và vanilla loss. Dùng 4 GPU trên cùng một máy, FSDP size 4 và vLLM TP 1.

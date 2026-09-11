@@ -12,6 +12,7 @@ import sys
 
 from config import build_lora_config
 from collect_results import collect_results
+from hardware_profiles import PROFILES, apply_hardware, hardware
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -20,7 +21,7 @@ METHOD = 'riskpo'
 WORLD_SIZE = 4
 
 
-def make_config(dataset, model_path, data_dir, checkpoint_dir, run_dir, run_name):
+def make_config(dataset, model_path, data_dir, checkpoint_dir, run_dir, run_name, hardware_profile='a100_4'):
     """Preserve the notebook training settings; change only paths and final output hooks."""
     cfg = build_lora_config(
         dataset, METHOD, MODEL_ID, data_dir, checkpoint_dir, run_name,
@@ -41,7 +42,7 @@ def make_config(dataset, model_path, data_dir, checkpoint_dir, run_dir, run_name
         'save_contents': ['model', 'optimizer', 'extra'],
         'load_contents': ['model', 'optimizer', 'extra'],
     }
-    return cfg
+    return apply_hardware(cfg, hardware_profile)
 
 
 def run(command, env, **kwargs):
@@ -128,7 +129,22 @@ def main(argv=None):
     parser.add_argument('--dataset', choices=['gsm8k', 'easymath', 'dapo'], default='gsm8k')
     parser.add_argument('--offline', action='store_true', help='Disable Hugging Face downloads; use existing model and processed data')
     parser.add_argument('--prepare-only', action='store_true', help='Check GPU/NCCL, data and config; do not train')
+    parser.add_argument('--hardware-profile', choices=PROFILES, default='a100_4')
+    parser.add_argument('--show-config', action='store_true', help='Print proposed config without GPU checks, downloads or training')
+    parser.add_argument('--benchmark-steps', type=int, help='Separate timing run, 3-20 training steps; no evaluation, checkpoint or export')
     args = parser.parse_args(argv)
+    world, gpu_family = hardware(args.hardware_profile)
+    if args.benchmark_steps is not None and not 3 <= args.benchmark_steps <= 20:
+        parser.error('--benchmark-steps must be between 3 and 20')
+    if args.show_config:
+        work = args.work_dir.expanduser().resolve()
+        cfg = make_config(args.dataset, args.model_path or MODEL_ID,
+                          args.data_dir or work / 'data/riskpo_reference', work / 'checkpoints/PREVIEW',
+                          work / 'runs/PREVIEW', 'PREVIEW', args.hardware_profile)
+        if args.benchmark_steps:
+            cfg['trainer'].update(total_training_steps=args.benchmark_steps, save_freq=-1, test_freq=-1)
+        print(json.dumps(cfg, indent=2))
+        return
     if not sys.platform.startswith('linux') or sys.version_info[:2] != (3, 10):
         parser.error('Use Linux with the Python 3.10 venv from README.md')
     work = args.work_dir.expanduser().resolve()
@@ -136,7 +152,7 @@ def main(argv=None):
     data_dir = args.data_dir.expanduser().resolve() if args.data_dir else work / 'data/riskpo_reference'
     env = dict(os.environ, VLLM_USE_V1='0', HYDRA_FULL_ERROR='1', TOKENIZERS_PARALLELISM='false',
                PYTHONUNBUFFERED='1', HF_HUB_DISABLE_TELEMETRY='1', RAY_USAGE_STATS_ENABLED='0')
-    env.setdefault('CUDA_VISIBLE_DEVICES', '0,1,2,3')
+    env.setdefault('CUDA_VISIBLE_DEVICES', ','.join(map(str, range(world))))
     env.setdefault('HF_HOME', str(work / 'hf_cache'))
     env['PYTHONPATH'] = str(REPO) + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
     if args.offline:
@@ -145,31 +161,41 @@ def main(argv=None):
     for key in ('HF_HOME', 'HF_HUB_OFFLINE', 'HF_DATASETS_OFFLINE', 'TRANSFORMERS_OFFLINE', 'HF_HUB_DISABLE_TELEMETRY'):
         if key in env:
             os.environ[key] = env[key]
-    run([sys.executable, HERE / 'check_environment.py'], env)
+    run([sys.executable, HERE / 'check_environment.py', '--gpu-count', world,
+         '--gpu-family', gpu_family, '--report', work / 'environment_report.json'], env)
+    preflight_script = HERE / 'distributed_preflight.py' if world == 4 else REPO / 'local_2l40/distributed_preflight.py'
     run([sys.executable, '-m', 'torch.distributed.run', '--standalone', '--nnodes=1',
-         '--nproc-per-node=4', HERE / 'distributed_preflight.py'], env, timeout=180)
+         f'--nproc-per-node={world}', preflight_script], env, timeout=180)
     base = resolve_model(args.model_path, args.offline)
     prepare_data(args.dataset, data_dir, args.offline, env)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
-    name = f'local_full_riskpo_Qwen3-4B_{args.dataset}_{stamp}'
+    mode = 'benchmark' if args.benchmark_steps else 'full'
+    name = f'local_full_riskpo_Qwen3-4B_{args.dataset}_{args.hardware_profile}_{mode}_{stamp}'
     run_dir = work / 'runs' / name
     run_dir.mkdir(parents=True, exist_ok=False)
     checkpoint = work / 'checkpoints' / name
-    cfg = make_config(args.dataset, base, data_dir, checkpoint, run_dir, name)
+    cfg = make_config(args.dataset, base, data_dir, checkpoint, run_dir, name, args.hardware_profile)
+    if args.benchmark_steps:
+        cfg['trainer'].update(total_training_steps=args.benchmark_steps, save_freq=-1, test_freq=-1)
     config_path = REPO / 'verl/trainer/config' / (name + '.yaml')
     config_path.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
     shutil.copy2(config_path, run_dir / 'config.yaml')
-    for filename in ('reward.py', 'thinking_dataset.py', 'config.py', 'train.py', 'notebook_provenance.json', 'requirements.txt'):
+    for filename in ('reward.py', 'thinking_dataset.py', 'config.py', 'train.py', 'hardware_profiles.py', 'notebook_provenance.json', 'requirements.txt'):
         shutil.copy2(HERE / filename, run_dir / filename)
     metadata = dict(json.loads((HERE / 'notebook_provenance.json').read_text(encoding='utf-8')),
                     model=MODEL_ID, base_snapshot=str(base), enable_thinking=False, dataset=args.dataset,
                     base_config_sha256=hashlib.sha256((base / 'config.json').read_bytes()).hexdigest(),
                     total_steps=cfg['trainer']['total_training_steps'], offline=args.offline,
-                    python=sys.executable, prepare_only=args.prepare_only)
+                    python=sys.executable, prepare_only=args.prepare_only,
+                    hardware_profile=args.hardware_profile, world_size=world, gpu_family=gpu_family,
+                    benchmark_only=bool(args.benchmark_steps))
+    if world == 2:
+        metadata['quatro_comparison'] = json.loads((REPO / 'local_2l40/notebook_comparison.json').read_text(encoding='utf-8'))
     (run_dir / 'run_metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     freeze = subprocess.check_output([sys.executable, '-m', 'pip', 'freeze'], env=env, text=True)
     (run_dir / 'requirements-freeze.txt').write_text(freeze, encoding='utf-8')
-    audit = {'config_dir': str(config_path.parent), 'config_name': name, 'run_dir': str(run_dir), 'dataset': args.dataset}
+    audit = {'config_dir': str(config_path.parent), 'config_name': name, 'run_dir': str(run_dir), 'dataset': args.dataset,
+             'world_size': world, 'hardware_profile': args.hardware_profile, 'benchmark_steps': args.benchmark_steps}
     audit_file = run_dir / 'audit_input.json'
     audit_file.write_text(json.dumps(audit), encoding='utf-8')
     env['TENSORBOARD_DIR'] = str(run_dir / 'tensorboard')
@@ -185,8 +211,17 @@ def main(argv=None):
         return
     (run_dir / 'command.json').write_text(json.dumps(command, indent=2), encoding='utf-8')
     train_process(command, env, run_dir / 'train.log')
+    if args.benchmark_steps:
+        from performance import summarize
+        report = summarize(run_dir / 'train.log', expected_steps=args.benchmark_steps)
+        report.update(hardware_profile=args.hardware_profile, benchmark_only=True,
+                      base_snapshot=str(base), results_are_accuracy_benchmark=False)
+        (run_dir / 'performance.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+        print(json.dumps(report, indent=2))
+        print('Timing run complete. No final model or accuracy result was produced.')
+        return
     steps = cfg['trainer']['total_training_steps']
-    results = collect_results(checkpoint, run_dir, steps, MODEL_ID, METHOD, args.dataset, WORLD_SIZE)
+    results = collect_results(checkpoint, run_dir, steps, MODEL_ID, METHOD, args.dataset, world)
     final_model = run_dir / 'final_model'
     run([sys.executable, HERE / 'export_model.py', '--base', base, '--adapter', results['adapter'],
          '--output', final_model, '--thinking', 'false', '--step', steps], env)

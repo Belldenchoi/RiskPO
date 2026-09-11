@@ -1,0 +1,19 @@
+{
+  "source_notebook": "RiskPO_QUATRO_Qwen3_8B_Colab.ipynb",
+  "source_sha256": "01001ddfc61bcd189f7215849c0c5229403dddf512256bc0446671b96911b8f2",
+  "model": "Qwen/Qwen3-4B",
+  "dataset": "gsm8k",
+  "enable_thinking": false,
+  "train_batch_size": 20,
+  "ppo_mini_batch_size": 20,
+  "rollout_n": 5,
+  "total_training_steps": 200,
+  "lora_rank": 8,
+  "lora_alpha": 16,
+  "method_difference": {
+    "hybrid": "risk_quatro + geometric ratio + seq-mean-token-mean",
+    "baseline": "grpo_bundle_RVaR_quantile_tracking + vanilla + token-mean"
+  },
+  "hardware": "2 L40; profile controls execution only",
+  "gpu_runtime_verified": false
+}

@@ -1,0 +1,2 @@
+# Same versions as the notebook. Use the existing venv when it passes checks.
+-r ../local_4a100/requirements.txt
